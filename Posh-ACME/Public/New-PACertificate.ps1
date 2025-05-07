@@ -56,6 +56,20 @@ function New-PACertificate {
     # grab the set of parameter keys to make comparisons easier later
     $psbKeys = $PSBoundParameters.Keys
 
+    if ('PfxPass' -in $psbKeys) {
+        if ($PfxPassSecure) {
+            # Warn that PfxPassSecure takes precedence over PfxPass if both are specified.
+            Write-Warning "PfxPass and PfxPassSecure were both specified. Using value from PfxPassSecure."
+        } else {
+            # Convert PfxPass to PfxPassSecure so it doesn't get logged in plain text.
+            Write-Debug "Converting PfxPass to PfxPassSecure"
+            $PfxPassSecure = ConvertTo-SecureString $PfxPass -AsPlainText -Force
+            $PSBoundParameters.PfxPassSecure = $PfxPassSecure
+        }
+        $null = $PSBoundParameters.Remove('PfxPass')
+        $PfxPass = $null
+    }
+
     # Make sure we have a refreshed server. But don't override the current
     # one unless explicitly specified.
     if ('DirectoryUrl' -in $psbKeys -or -not (Get-PAServer -Refresh)) {
@@ -97,20 +111,6 @@ function New-PACertificate {
         $OCSPMustStaple = New-Object Management.Automation.SwitchParameter($csrDetails.OCSPMustStaple)
     }
 
-    # PfxPassSecure takes precedence over PfxPass if both are specified but we
-    # need the value in plain text. So we'll just take over the PfxPass variable
-    # to use for the rest of the function.
-    if ($PfxPassSecure) {
-        # throw a warning if they also specified PfxPass
-        if ('PfxPass' -in $psbKeys) {
-            Write-Warning "PfxPass and PfxPassSecure were both specified. Using value from PfxPassSecure."
-        }
-
-        # override the existing PfxPass parameter
-        $PfxPass = [pscredential]::new('u',$PfxPassSecure).GetNetworkCredential().Password
-        $PSBoundParameters.PfxPass = $PfxPass
-    }
-
     # Generate an appropriate name if one wasn't specified
     if (-not $Name) {
         $Name = $Domain[0].Replace('*','!')
@@ -128,6 +128,7 @@ function New-PACertificate {
     # - has different SANs
     # - has different CSR
     # - has different Lifetime
+    # - has different Profile
     $order = Get-PAOrder -Name $Name -Refresh
     $oldOrder = $null
     $SANs = @($Domain | Where-Object { $_ -ne $Domain[0] }) | Sort-Object
@@ -135,10 +136,11 @@ function New-PACertificate {
         $order.status -in 'invalid','deactivated' -or
         ($order.status -eq 'valid' -and $order.RenewAfter -and (Get-DateTimeOffsetNow) -ge ([DateTimeOffset]::Parse($order.RenewAfter))) -or
         ($order.status -eq 'pending' -and (Get-DateTimeOffsetNow) -gt ([DateTimeOffset]::Parse($order.expires))) -or
-        $CertKeyLength -ne $order.KeyLength -or
+        ('CertKeyLength' -in $psbKeys -and $CertKeyLength -ne $order.KeyLength) -or
         ($SANs -join ',') -ne (($order.SANs | Sort-Object) -join ',') -or
         ($csrDetails -and $csrDetails.Base64Url -ne $order.CSRBase64Url ) -or
-        ($LifetimeDays -and $LifetimeDays -ne $order.LifetimeDays) )
+        ($LifetimeDays -and $LifetimeDays -ne $order.LifetimeDays) -or
+        ($Profile -and $Profile -ne $order.Profile) )
     {
 
         $oldOrder = $order
@@ -161,7 +163,6 @@ function New-PACertificate {
                 AlwaysNewKey           = $AlwaysNewKey
                 Subject                = $Subject
                 FriendlyName           = $FriendlyName
-                PfxPass                = $PfxPass
                 UseModernPfxEncryption = $UseModernPfxEncryption
                 Install                = $Install
             }
@@ -173,7 +174,6 @@ function New-PACertificate {
                     'AlwaysNewKey'
                     'Subject'
                     'FriendlyName'
-                    'PfxPass'
                     'UseModernPfxEncryption'
                     'Install' ) | ForEach-Object {
 
@@ -216,6 +216,16 @@ function New-PACertificate {
                 $orderParams.$_ = $oldOrder.$_
             }
         }
+
+        # Add the old PfxPass if it exists and a new one wasn't explicitly specified
+        if ($oldOrder -and 'PfxPassSecure' -notin $psbKeys) {
+            $orderParams.PfxPassSecure = ConvertTo-SecureString $oldOrder.PfxPass -AsPlainText -Force
+        } else {
+            # Otherwise use the explicit or default value
+            $orderParams.PfxPassSecure = $PfxPassSecure
+        }
+
+        # Add new PluginArgs if specified
         if ('PluginArgs' -in $psbKeys) {
             $orderParams.PluginArgs = $PluginArgs
         }
@@ -238,7 +248,7 @@ function New-PACertificate {
             'Install'
             'Subject'
             'FriendlyName'
-            'PfxPass'
+            'PfxPassSecure'
             'UseModernPfxEncryption'
             'Install'
             'DnsSleep'
